@@ -331,6 +331,36 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
 
 
+def _update_router_expert_bias_heterogeneous(
+    tokens_per_expert_list: List[torch.Tensor],
+    expert_bias_list: List[torch.Tensor],
+    expert_bias_update_rate: float,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Update router biases when MoE layers have different expert counts."""
+    with torch.no_grad():
+        if tp_dp_cp_group is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        flat_tokens_per_expert = torch.cat(
+            [tokens_per_expert.flatten() for tokens_per_expert in tokens_per_expert_list]
+        )
+        torch.distributed.all_reduce(flat_tokens_per_expert, group=tp_dp_cp_group)
+
+        start = 0
+        for tokens_per_expert, expert_bias in zip(tokens_per_expert_list, expert_bias_list):
+            num_experts = tokens_per_expert.numel()
+            reduced_tokens_per_expert = flat_tokens_per_expert[start : start + num_experts]
+            start += num_experts
+            average_tokens = reduced_tokens_per_expert.sum() / num_experts
+            offset = average_tokens - reduced_tokens_per_expert
+            expert_bias.add_(
+                torch.sign(offset).reshape(expert_bias.shape) * expert_bias_update_rate
+            )
+
+
 def _update_router_expert_bias(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -357,6 +387,14 @@ def _update_router_expert_bias(
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
+        return
+    if len({tokens_per_expert.shape for tokens_per_expert in tokens_per_expert_list}) > 1:
+        _update_router_expert_bias_heterogeneous(
+            tokens_per_expert_list,
+            expert_bias_list,
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)

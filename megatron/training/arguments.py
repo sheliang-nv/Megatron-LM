@@ -2266,6 +2266,9 @@ def _add_network_size_args(parser):
         "use_inference_optimized_layers",
         "heterogeneous_block_specs",
         "hetereogenous_dist_checkpoint",
+        "per_layer_config_overrides",
+        "mtp_pattern_length",
+        "mtp_per_layer_config_overrides",
         "quant_recipe",
         # deprecated and no CLI arg exists
         "tp_comm_atomic_ag",

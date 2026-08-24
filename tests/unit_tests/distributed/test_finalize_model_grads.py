@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _update_router_expert_bias_heterogeneous,
     _update_router_qb_beta,
     finalize_model_grads,
     reset_model_temporary_tensors,
@@ -71,6 +73,22 @@ def _router_bias_pg_collection(tp_dp_cp=_NO_TP_DP_CP):
     if tp_dp_cp is not _NO_TP_DP_CP:
         kwargs['tp_dp_cp'] = tp_dp_cp
     return ProcessGroupCollection(**kwargs)
+
+
+def test_updates_router_biases_with_different_expert_counts():
+    tokens_per_expert = [torch.tensor([1.0, 3.0]), torch.tensor([2.0, 2.0, 6.0, 2.0])]
+    expert_bias = [torch.zeros(2), torch.zeros(4)]
+    process_group = object()
+
+    with patch("torch.distributed.all_reduce") as all_reduce:
+        _update_router_expert_bias_heterogeneous(
+            tokens_per_expert, expert_bias, 0.1, tp_dp_cp_group=process_group
+        )
+
+    all_reduce.assert_called_once()
+    assert all_reduce.call_args.kwargs["group"] is process_group
+    torch.testing.assert_close(expert_bias[0], torch.tensor([0.1, -0.1]))
+    torch.testing.assert_close(expert_bias[1], torch.tensor([0.1, 0.1, -0.1, 0.1]))
 
 
 class TestFinalizeModelGradsMoEExpertBias:

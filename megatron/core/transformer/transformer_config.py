@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -1206,10 +1206,46 @@ class TransformerConfig(ModelParallelConfig):
     during training."""
 
     heterogeneous_block_specs: bool = False
-    """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
+    """Whether to use heterogeneous block specs.
+
+    This is enabled automatically when sparse per-layer overrides are provided.
+    """
 
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
+
+    per_layer_config_overrides: Optional[List[Optional[Dict[str, Any]]]] = None
+    """Sparse per-layer overrides for the main model block.
+
+    The list length must match ``num_layers``. Each entry is either ``None`` or a
+    dictionary containing fields from ``_ALLOWED_PER_LAYER_OVERRIDE_KEYS``.
+    """
+
+    mtp_pattern_length: Optional[int] = None
+    """Number of layer positions in one MTP depth's hybrid pattern."""
+
+    mtp_per_layer_config_overrides: Optional[List[Optional[Dict[str, Any]]]] = None
+    """Sparse per-position overrides shared by every MTP depth."""
+
+    _ALLOWED_PER_LAYER_OVERRIDE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "ffn_hidden_size",
+            "moe_ffn_hidden_size",
+            "num_moe_experts",
+            "moe_router_topk",
+            "moe_shared_expert_intermediate_size",
+            "mamba_state_dim",
+            "mamba_head_dim",
+            "mamba_num_groups",
+            "mamba_num_heads",
+        }
+    )
+    """Transformer fields supported by sparse per-layer overrides."""
+
+    _NONE_ALLOWED_OVERRIDE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"moe_shared_expert_intermediate_size", "mamba_num_heads"}
+    )
+    """Per-layer fields for which ``None`` has architecture semantics."""
 
     ####################
     # Quantization
@@ -2893,6 +2929,104 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
+
+        self._validate_per_layer_config_overrides()
+
+    def _validate_per_layer_config_overrides(self) -> None:
+        """Validate sparse architecture overrides and enable heterogeneous specs."""
+
+        def _validate_entries(field_name: str, entries: List[Optional[Dict[str, Any]]]) -> None:
+            for index, entry in enumerate(entries):
+                if entry is None:
+                    continue
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"{field_name}[{index}] must be a dict or None, got {type(entry)}."
+                    )
+                unknown = set(entry) - self._ALLOWED_PER_LAYER_OVERRIDE_KEYS
+                if unknown:
+                    raise ValueError(
+                        f"{field_name}[{index}] has unknown override keys: {sorted(unknown)}. "
+                        f"Allowed: {sorted(self._ALLOWED_PER_LAYER_OVERRIDE_KEYS)}."
+                    )
+                for key, value in entry.items():
+                    none_allowed = key in self._NONE_ALLOWED_OVERRIDE_KEYS
+                    if value is None:
+                        if not none_allowed:
+                            raise ValueError(
+                                f"{field_name}[{index}][{key!r}] does not accept None; "
+                                "it must be a positive int."
+                            )
+                    elif not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                        suffix = " or None" if none_allowed else ""
+                        raise ValueError(
+                            f"{field_name}[{index}][{key!r}] must be a positive int{suffix}, "
+                            f"got {value!r}."
+                        )
+
+        has_per_layer_overrides = False
+        if self.per_layer_config_overrides is not None:
+            has_per_layer_overrides = True
+            if len(self.per_layer_config_overrides) != self.num_layers:
+                raise ValueError(
+                    "per_layer_config_overrides length "
+                    f"({len(self.per_layer_config_overrides)}) must match num_layers "
+                    f"({self.num_layers})."
+                )
+            _validate_entries("per_layer_config_overrides", self.per_layer_config_overrides)
+
+        if self.mtp_per_layer_config_overrides is not None:
+            has_per_layer_overrides = True
+            if self.mtp_pattern_length is None:
+                raise ValueError(
+                    "mtp_pattern_length must be set when mtp_per_layer_config_overrides is set."
+                )
+            if len(self.mtp_per_layer_config_overrides) != self.mtp_pattern_length:
+                raise ValueError(
+                    "mtp_per_layer_config_overrides length "
+                    f"({len(self.mtp_per_layer_config_overrides)}) must match "
+                    f"mtp_pattern_length ({self.mtp_pattern_length})."
+                )
+            _validate_entries("mtp_per_layer_config_overrides", self.mtp_per_layer_config_overrides)
+
+        if has_per_layer_overrides:
+            self.heterogeneous_block_specs = True
+
+    def _apply_overrides(self, overrides: Optional[Dict[str, Any]]) -> "TransformerConfig":
+        """Return a same-type config with one layer's sparse overrides applied."""
+        if not overrides:
+            return self
+
+        from dataclasses import replace as dataclass_replace
+
+        updates = dict(overrides)
+        updates.setdefault("heterogeneous_block_specs", False)
+        updates.setdefault("per_layer_config_overrides", None)
+        updates.setdefault("mtp_per_layer_config_overrides", None)
+        return dataclass_replace(self, **updates)
+
+    def get_config_for_layer(self, layer_number: int) -> "TransformerConfig":
+        """Return the resolved config for a 1-indexed main-block layer."""
+        if self.per_layer_config_overrides is None:
+            return self
+        layer_index = layer_number - 1
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise ValueError(
+                f"Invalid layer_number={layer_number}. Must be in [1, {self.num_layers}]."
+            )
+        return self._apply_overrides(self.per_layer_config_overrides[layer_index])
+
+    def get_config_for_mtp_layer(self, layer_number: int) -> "TransformerConfig":
+        """Return the resolved config for a 1-indexed position in an MTP depth."""
+        if self.mtp_per_layer_config_overrides is None:
+            return self
+        layer_index = layer_number - 1
+        override_count = len(self.mtp_per_layer_config_overrides)
+        if layer_index < 0 or layer_index >= override_count:
+            raise ValueError(
+                f"Invalid MTP layer_number={layer_number}. Must be in [1, {override_count}]."
+            )
+        return self._apply_overrides(self.mtp_per_layer_config_overrides[layer_index])
 
 
 @dataclass
